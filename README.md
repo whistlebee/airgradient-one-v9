@@ -1,4 +1,12 @@
-# Firmware for Airgradient ONE v9
+# Firmware for Airgradient ONE v9 to push results to MQTT broker
+
+based on https://github.com/lschloetterer/airgradient-one-v9
+
+## Changes
+- Write to MQTT broker instead of HTTP endpoint
+- Included a simple golang MQTT subscriber that writes to TimescaleDB
+
+## Upstream README
 
 based on https://github.com/airgradienthq/arduino
 
