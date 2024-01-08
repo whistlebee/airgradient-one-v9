@@ -29,38 +29,27 @@ CC BY-SA 4.0 Attribution-ShareAlike 4.0 International License
 
 */
 
-#include "PMS.h"
-
 #include <HardwareSerial.h>
-
 #include <Wire.h>
-
-#include "s8_uart.h"
-
-#include <HTTPClient.h>
-
 #include <WiFiManager.h>
-
 #include <Adafruit_NeoPixel.h>
-
 #include <EEPROM.h>
-
-#include "SHTSensor.h"
-
 #include <SensirionI2CSgp41.h>
-
 #include <NOxGasIndexAlgorithm.h>
-
 #include <VOCGasIndexAlgorithm.h>
-
 #include <U8g2lib.h>
+#include <SPI.h>
+#include <MQTT.h>
+#include <cstdint>
+
+#include "PMS.h"
+#include "SHTSensor.h"
+#include "s8_uart.h"
 
 #define DEBUG true
 
 #define I2C_SDA 7
 #define I2C_SCL 6
-
-HTTPClient client;
 
 Adafruit_NeoPixel pixels(11, 10, NEO_GRB + NEO_KHZ800);
 SensirionI2CSgp41 sgp41;
@@ -139,6 +128,11 @@ int currentState;
 unsigned long pressedTime = 0;
 unsigned long releasedTime = 0;
 
+int remainingretries = 10;
+
+MQTTClient mqttclient(256);
+WiFiClient wificlient;
+
 void setup() {
   if (DEBUG) {
     Serial.begin(115200);
@@ -199,23 +193,57 @@ void setup() {
     inConf();
   }
 
-   if (connectWIFI) connectToWifi();
-    if (WiFi.status() == WL_CONNECTED) {
-      sendPing();
-      Serial.println(F("WiFi connected!"));
-      Serial.println("IP address: ");
-      Serial.println(WiFi.localIP());
-    }
+  if (connectWIFI) connectToWifi();
+  mqttclient.begin(IPAddress(192, 168, 1, 161), 1883, wificlient);
+  mqttclient.onMessage(messageReceived);
+  connect_mqtt();
   updateOLED2("Warming Up", "Serial Number:", String(getNormalizedMac()));
 }
 
+void messageReceived(String &topic, String &payload) {
+  Serial.println("incoming: " + topic + " - " + payload);
+
+  // Note: Do not use the client in the callback to publish, subscribe or
+  // unsubscribe as it may cause deadlocks when other things arrive while
+  // sending and receiving acknowledgments. Instead, change a global variable,
+  // or push to a queue and handle it in the loop after calling `client.loop()`.
+}
+
+
+void connect_mqtt() {
+  Serial.print("checking wifi...");
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(1000);
+  }
+  Serial.print("\nconnecting to mqtt broker...");
+  while (remainingretries && !mqttclient.connect("arduino", "public", "public")) {
+    Serial.print(".");
+    delay(1000);
+    remainingretries--;
+  }
+  if (!remainingretries) {
+    Serial.println("mqtt connection failed");
+    return;
+  }
+  Serial.println("\nmqtt client connected");
+  //Serial.println("\nconnected!");
+  mqttclient.subscribe("/hello");
+  // client.unsubscribe("/hello");
+}
+
 void loop() {
+  mqttclient.loop();
+  if (!mqttclient.connected()) {
+    connect_mqtt();
+  }
   currentMillis = millis();
   updateTVOC();
   updateOLED();
   updateCo2();
   updatePm();
   updateTempHum();
+
   sendToServer();
 }
 
@@ -249,7 +277,7 @@ void updateTVOC() {
     if (error) {
       TVOC = -1;
       NOX = -1;
-      Serial.println(String(TVOC));
+      Serial.println("Error in measureRawSignals()");
     } else {
       TVOC = voc_algorithm.process(srawVoc);
       NOX = nox_algorithm.process(srawNox);
@@ -529,35 +557,51 @@ void updateOLED3() {
   } while (u8g2.nextPage());
 }
 
+typedef struct {
+  int32_t wifi; // wifi signal strength
+  int32_t rco2; // CO2
+  int32_t pm01; // PM1.0
+  int32_t pm25; // PM2.5
+  int32_t pm10; // PM10
+  int32_t pm03PCount; // PM0.3
+  int32_t tvoc_index; // TVOC
+  int32_t nox_index; // NOx
+  float atmp; // temperature
+  int32_t rhum; // humidity
+  int32_t boot; // loopCount
+} payload;
+
+char payloadbuffer[sizeof(payload)];
+
 void sendToServer() {
   if (currentMillis - previoussendToServer >= sendToServerInterval) {
     previoussendToServer += sendToServerInterval;
-    String payload = "{\"wifi\":" + String(WiFi.RSSI()) +
-      (Co2 < 0 ? "" : ", \"rco2\":" + String(Co2)) +
-      (pm01 < 0 ? "" : ", \"pm01\":" + String(pm01)) +
-      (pm25 < 0 ? "" : ", \"pm02\":" + String(pm25)) +
-      (pm10 < 0 ? "" : ", \"pm10\":" + String(pm10)) +
-//      (pm03PCount < 0 ? "" : ", \"pm003_count\":" + String(pm03PCount)) +
-      (TVOC < 0 ? "" : ", \"tvoc_index\":" + String(TVOC)) +
-      (NOX < 0 ? "" : ", \"nox_index\":" + String(NOX)) +
-      ", \"atmp\":" + String(temp) +
-      (hum < 0 ? "" : ", \"rhum\":" + String(hum)) +
-      ", \"boot\":" + loopCount +
-      "}";
+
+    payload p = {
+      WiFi.RSSI(),
+      Co2,
+      pm01,
+      pm25,
+      pm10,
+      -1,
+      TVOC,
+      NOX,
+      temp,
+      hum,
+      loopCount
+    };
+
+    Serial.println("Loopcount: " + String(loopCount) + "\n");
+    memcpy(payloadbuffer, &p, sizeof(payload));
 
     if (WiFi.status() == WL_CONNECTED) {
-      Serial.println(payload);
-      String POSTURL = APIROOT + "sensors/airgradient:" + String(getNormalizedMac()) + "/measures";
-      Serial.println(POSTURL);
-      WiFiClient client;
-      HTTPClient http;
-      http.begin(client, POSTURL);
-      http.addHeader("content-type", "application/json");
-      int httpCode = http.POST(payload);
-      String response = http.getString();
-      Serial.println(httpCode);
-      Serial.println(response);
-      http.end();
+      // send payload as-is
+      bool res = mqttclient.publish("/office", payloadbuffer, sizeof(payload));
+      if (!res) {
+        Serial.println("mqtt publish failed");
+      } else {
+        Serial.println("published to mqtt");
+      }
       resetWatchdog();
       loopCount++;
     } else {
@@ -594,7 +638,6 @@ void connectToWifi() {
     Serial.println("failed to connect and hit timeout");
     delay(6000);
   }
-
 }
 
 void debug(String msg) {
